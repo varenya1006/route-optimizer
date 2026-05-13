@@ -14,38 +14,83 @@ import osmnx as ox
 import json
 import time
 import math
+import os
+import requests
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 from geopy.distance import geodesic
+from dotenv import load_dotenv
+
+# ── Load environment variables ────────────────────────────────────────────────
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
+# ── API keys from .env (optional) ─────────────────────────────────────────────
+ORS_API_KEY = os.environ.get("ORS_API_KEY", "")
+
 # ── In-memory graph store ──────────────────────────────────────────────────────
 _graph_db: Dict[str, nx.MultiDiGraph] = {}
-_simulation_config = {"congestion_factor": 1.0, "delay_per_edge": 0.0}
+_simulation_config = {"congestion_factor": 1.0, "delay_per_edge": 0.0, "hour_of_day": datetime.now().hour}
 
 # ── OSM graph constants ────────────────────────────────────────────────────────
 OSM_GRAPH_ID = "nagpur_osm"
 OSM_CENTER = (21.1458, 79.0882)   # Nagpur, Maharashtra
 OSM_DIST   = 5000                  # metres radius
 
+# ── Graph cache ────────────────────────────────────────────────────────────────
+GRAPH_CACHE_DIR = os.environ.get("GRAPH_CACHE_DIR", os.path.join(os.path.dirname(__file__), "cache"))
+GRAPHML_PATH = os.path.join(GRAPH_CACHE_DIR, "nagpur_graph.graphml")
+os.makedirs(GRAPH_CACHE_DIR, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Startup: load real-world OSM graph
+# Time-of-day speed profiles (km/h) by road class
+# Based on typical Indian urban traffic patterns
+# ═══════════════════════════════════════════════════════════════════════════════
+SPEED_PROFILES = {
+    "motorway":     {"00-05": 90, "05-08": 70, "08-11": 55, "11-14": 65, "14-17": 50, "17-20": 45, "20-24": 75},
+    "trunk":        {"00-05": 80, "05-08": 60, "08-11": 45, "11-14": 55, "14-17": 40, "17-20": 35, "20-24": 65},
+    "primary":      {"00-05": 70, "05-08": 50, "08-11": 35, "11-14": 45, "14-17": 30, "17-20": 28, "20-24": 55},
+    "secondary":    {"00-05": 60, "05-08": 45, "08-11": 30, "11-14": 40, "14-17": 28, "17-20": 25, "20-24": 50},
+    "tertiary":     {"00-05": 50, "05-08": 40, "08-11": 28, "11-14": 35, "14-17": 25, "17-20": 22, "20-24": 42},
+    "residential":  {"00-05": 40, "05-08": 35, "08-11": 25, "11-14": 30, "14-17": 22, "17-20": 20, "20-24": 35},
+    "unclassified": {"00-05": 45, "05-08": 38, "08-11": 28, "11-14": 33, "14-17": 25, "17-20": 22, "20-24": 38},
+    "service":      {"00-05": 30, "05-08": 25, "08-11": 20, "11-14": 22, "14-17": 18, "17-20": 15, "20-24": 25},
+}
+
+
+def _get_speed_for_road_class(road_class: str, hour: int) -> float:
+    """Get typical speed (km/h) for a road class at a given hour."""
+    profile = SPEED_PROFILES.get(road_class, SPEED_PROFILES["unclassified"])
+    # Find the right time bucket
+    buckets = [
+        (0, 5, "00-05"), (5, 8, "05-08"), (8, 11, "08-11"), (11, 14, "11-14"),
+        (14, 17, "14-17"), (17, 20, "17-20"), (20, 24, "20-24")
+    ]
+    for start, end, key in buckets:
+        if start <= hour < end:
+            return profile[key]
+    return profile["00-05"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Startup: load real-world OSM graph (cached)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_osm_graph():
-    print(f"[startup] Loading OSM graph for Nagpur ({OSM_DIST}m radius)…")
+    if os.path.exists(GRAPHML_PATH):
+        print(f"[startup] Loading cached OSM graph from {GRAPHML_PATH}…")
+        G = ox.load_graphml(GRAPHML_PATH)
+        _graph_db[OSM_GRAPH_ID] = G
+        print(f"[startup] Cached graph loaded — {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+        return
+
+    print(f"[startup] Downloading OSM graph for Nagpur ({OSM_DIST}m radius)…")
     G = ox.graph_from_point(OSM_CENTER, dist=OSM_DIST, network_type="drive")
-
-    # Traffic simulation: inflate first 5000 edge weights by 1.3×
-    for u, v, data in list(G.edges(data=True))[:5000]:
-        if "length" in data:
-            data["length"] *= 1.3
-
+    ox.save_graphml(G, GRAPHML_PATH)
     _graph_db[OSM_GRAPH_ID] = G
-    print(f"[startup] OSM graph loaded — {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+    print(f"[startup] OSM graph downloaded & cached — {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -60,10 +105,6 @@ def _get_nearest_node(G, lat: float, lon: float) -> int:
     return u if geodesic((lat, lon), u_pt).meters < geodesic((lat, lon), v_pt).meters else v
 
 
-def _nodes_to_coords(G, route: List) -> List[List[float]]:
-    return [[G.nodes[n]["y"], G.nodes[n]["x"]] for n in route]
-
-
 def _route_length(G, route: List) -> float:
     length = 0.0
     for a, b in zip(route, route[1:]):
@@ -74,10 +115,44 @@ def _route_length(G, route: List) -> float:
     return length
 
 
+def _route_to_coords_lightweight(G, route: List, max_points_per_edge: int = 8, min_edge_meters: float = 80.0) -> List[List[float]]:
+    """Returns route coordinates that follow actual road curvature."""
+    coords = []
+    for u, v in zip(route, route[1:]):
+        edge_data = min(G.get_edge_data(u, v).values(), key=lambda d: d.get("length", 0))
+        length = edge_data.get("length", 0)
+        if "geometry" in edge_data and length > min_edge_meters:
+            geom = edge_data["geometry"]
+            pts = list(geom.coords)
+            if len(pts) > max_points_per_edge:
+                step = max(1, len(pts) // max_points_per_edge)
+                pts = pts[::step]
+                last_pt = list(geom.coords)[-1]
+                if tuple(pts[-1]) != tuple(last_pt):
+                    pts.append(last_pt)
+        else:
+            pts = [
+                (G.nodes[u]["x"], G.nodes[u]["y"]),
+                (G.nodes[v]["x"], G.nodes[v]["y"])
+            ]
+        for lon, lat in pts:
+            pt = [lat, lon]
+            if not coords or pt != coords[-1]:
+                coords.append(pt)
+    return coords
+
+
 def _heuristic_osm(G, u, v) -> float:
-    x1, y1 = G.nodes[u]["x"], G.nodes[u]["y"]
-    x2, y2 = G.nodes[v]["x"], G.nodes[v]["y"]
-    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+    """Admissible haversine heuristic in meters."""
+    y1, x1 = G.nodes[u]["y"], G.nodes[u]["x"]
+    y2, x2 = G.nodes[v]["y"], G.nodes[v]["x"]
+    lat1, lon1 = math.radians(y1), math.radians(x1)
+    lat2, lon2 = math.radians(y2), math.radians(x2)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    c = 2 * math.asin(math.sqrt(a))
+    return 6371000 * c
 
 
 def _heuristic_generic(u: str, v: str, G: nx.DiGraph) -> float:
@@ -86,30 +161,144 @@ def _heuristic_generic(u: str, v: str, G: nx.DiGraph) -> float:
     return math.sqrt((pos_u[0] - pos_v[0]) ** 2 + (pos_u[1] - pos_v[1]) ** 2)
 
 
-def _apply_traffic_delay(G, path: List) -> Tuple[List, float, Dict]:
-    weight_key = "length" if OSM_GRAPH_ID in _graph_db and G is _graph_db.get(OSM_GRAPH_ID) else "weight"
+def _get_routing_graph(G, use_time_traffic: bool = False):
+    """Return a graph with traffic-adjusted weights and the weight key to use."""
+    cf = _simulation_config["congestion_factor"]
+    dp = _simulation_config["delay_per_edge"]
+    hour = _simulation_config.get("hour_of_day", datetime.now().hour)
 
+    if not use_time_traffic and abs(cf - 1.0) < 1e-9 and abs(dp) < 1e-9:
+        return G, "length"
+
+    H = G.copy()
+    for u, v, key, data in H.edges(keys=True, data=True):
+        base = data.get("length", 1.0)
+
+        if use_time_traffic:
+            # Time-of-day weight: length / speed * 3.6 (convert km/h to m/s, then to seconds)
+            road_class = data.get("highway", "unclassified")
+            if isinstance(road_class, list):
+                road_class = road_class[0]
+            speed_kmh = _get_speed_for_road_class(road_class, hour)
+            speed_ms = speed_kmh / 3.6
+            data["weight"] = base / speed_ms if speed_ms > 0 else base
+        else:
+            delay = dp * cf
+            data["weight"] = base * cf + delay
+
+    return H, "weight"
+
+
+def _apply_traffic_delay(G, path: List) -> Tuple[List, float, Dict]:
     def edge_w(u, v):
         ed = G.get_edge_data(u, v)
-        if isinstance(ed, dict) and 0 in ed:      # MultiDiGraph
-            return ed[0].get(weight_key, 1.0)
+        if isinstance(ed, dict) and 0 in ed:
+            return ed[0].get("length", 1.0)
         if isinstance(ed, dict):
-            return ed.get(weight_key, 1.0)
+            return ed.get("length", 1.0)
         return 1.0
-
-    base_weight  = sum(edge_w(u, v) for u, v in zip(path, path[1:]))
-    congestion   = _simulation_config["congestion_factor"]
-    delay_per_e  = _simulation_config["delay_per_edge"]
-    total_delay  = delay_per_e * max(0, len(path) - 1) * congestion
-    adjusted     = base_weight * congestion + total_delay
-
+    base_weight = sum(edge_w(u, v) for u, v in zip(path, path[1:]))
+    congestion = _simulation_config["congestion_factor"]
+    delay_per_e = _simulation_config["delay_per_edge"]
+    total_delay = delay_per_e * max(0, len(path) - 1) * congestion
+    adjusted = base_weight * congestion + total_delay
     return path, round(adjusted, 2), {
-        "base_weight":        round(base_weight, 2),
-        "congestion_factor":  congestion,
-        "total_delay":        round(total_delay, 2),
-        "adjusted_weight":    round(adjusted, 2),
-        "edge_count":         len(path) - 1,
+        "base_weight": round(base_weight, 2),
+        "congestion_factor": congestion,
+        "total_delay": round(total_delay, 2),
+        "adjusted_weight": round(adjusted, 2),
+        "edge_count": len(path) - 1,
     }
+
+
+def _estimate_travel_time(G, path: List, hour: int) -> float:
+    """Estimate realistic travel time (seconds) using time-of-day speeds."""
+    total_time = 0.0
+    for a, b in zip(path, path[1:]):
+        edges = G.get_edge_data(a, b)
+        if edges:
+            best = min(edges.values(), key=lambda d: d.get("length", 0))
+            length = best.get("length", 0)
+            road_class = best.get("highway", "unclassified")
+            if isinstance(road_class, list):
+                road_class = road_class[0]
+            speed_kmh = _get_speed_for_road_class(road_class, hour)
+            speed_ms = speed_kmh / 3.6
+            total_time += length / speed_ms if speed_ms > 0 else length / 8.33
+    return total_time
+
+
+def _find_alternative_paths(G, source, target, num_paths=3, max_factor=1.3, penalty=0.5, similarity_threshold=0.65):
+    """Find multiple diverse paths of similar length using iterative edge penalty."""
+    weight_key = "length"
+    try:
+        p1 = nx.shortest_path(G, source, target, weight=weight_key)
+    except nx.NetworkXNoPath:
+        return []
+    shortest_len = _route_length(G, p1)
+    max_allowed = shortest_len * max_factor
+    results = [(p1, shortest_len)]
+    penalized_edges = set()
+    for u, v in zip(p1, p1[1:]):
+        penalized_edges.add((min(u, v), max(u, v)))
+    current_penalty = penalty
+    for _ in range(num_paths - 1):
+        def make_weight_fn(pen_edges, pen_mult):
+            def weight_fn(u, v, d):
+                base = d.get(weight_key, 1.0)
+                if (min(u, v), max(u, v)) in pen_edges:
+                    return base * (1 + pen_mult)
+                return base
+            return weight_fn
+        wfn = make_weight_fn(penalized_edges, current_penalty)
+        try:
+            alt = nx.shortest_path(G, source, target, weight=wfn)
+            alt_len = _route_length(G, alt)
+            if alt_len > max_allowed:
+                if current_penalty > 0.2:
+                    current_penalty = max(0.1, current_penalty - 0.2)
+                    wfn = make_weight_fn(penalized_edges, current_penalty)
+                    alt = nx.shortest_path(G, source, target, weight=wfn)
+                    alt_len = _route_length(G, alt)
+                    if alt_len > max_allowed:
+                        break
+                else:
+                    break
+            alt_edge_set = set((min(u, v), max(u, v)) for u, v in zip(alt, alt[1:]))
+            is_diverse = True
+            for existing_path, _ in results:
+                existing_edge_set = set((min(u, v), max(u, v)) for u, v in zip(existing_path, existing_path[1:]))
+                jaccard = len(alt_edge_set & existing_edge_set) / len(alt_edge_set | existing_edge_set) if len(alt_edge_set | existing_edge_set) > 0 else 0
+                if jaccard > similarity_threshold:
+                    is_diverse = False
+                    break
+            if not is_diverse:
+                current_penalty += 0.3
+                wfn = make_weight_fn(penalized_edges, current_penalty)
+                try:
+                    alt = nx.shortest_path(G, source, target, weight=wfn)
+                    alt_len = _route_length(G, alt)
+                    if alt_len > max_allowed:
+                        break
+                    alt_edge_set = set((min(u, v), max(u, v)) for u, v in zip(alt, alt[1:]))
+                    is_diverse = True
+                    for existing_path, _ in results:
+                        existing_edge_set = set((min(u, v), max(u, v)) for u, v in zip(existing_path, existing_path[1:]))
+                        jaccard = len(alt_edge_set & existing_edge_set) / len(alt_edge_set | existing_edge_set) if len(alt_edge_set | existing_edge_set) > 0 else 0
+                        if jaccard > similarity_threshold:
+                            is_diverse = False
+                            break
+                    if not is_diverse:
+                        break
+                except nx.NetworkXNoPath:
+                    break
+            results.append((alt, alt_len))
+            for u, v in zip(alt, alt[1:]):
+                penalized_edges.add((min(u, v), max(u, v)))
+            current_penalty = penalty
+        except nx.NetworkXNoPath:
+            break
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -122,21 +311,109 @@ def index():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Map routing endpoint (used by Leaflet UI)
+# Geocode & Reverse Geocode
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/geocode", methods=["GET"])
+def geocode_proxy():
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"error": "Missing query parameter 'q'"}), 400
+    try:
+        headers = {"User-Agent": "RouteOptimizer-Nagpur/1.0"}
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {"format": "json", "q": q, "limit": 1}
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/reverse-geocode", methods=["GET"])
+def reverse_geocode_proxy():
+    lat = request.args.get("lat", "").strip()
+    lon = request.args.get("lon", "").strip()
+    if not lat or not lon:
+        return jsonify({"error": "Missing lat/lon parameters"}), 400
+    try:
+        headers = {"User-Agent": "RouteOptimizer-Nagpur/1.0"}
+        url = "https://nominatim.openstreetmap.org/reverse"
+        params = {"format": "json", "lat": lat, "lon": lon, "zoom": 18}
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ORS Reference Route — completely free, no credit card
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/traffic-reference", methods=["POST"])
+def traffic_reference():
+    """
+    POST /traffic-reference
+    Proxies a route from OpenRouteService (free, no credit card required).
+    Returns the external route geometry + duration for comparison.
+    """
+    data = request.get_json(force=True)
+    start_lat, start_lon = data["start"]
+    end_lat, end_lon = data["end"]
+
+    return _ors_route(start_lon, start_lat, end_lon, end_lat)
+
+
+def _ors_route(slon, slat, elon, elat):
+    """Call OpenRouteService Directions API. Free tier: 500 req/day without key."""
+    try:
+        url = "https://api.openrouteservice.org/v2/directions/driving-car"
+        headers = {"Content-Type": "application/json"}
+        if ORS_API_KEY:
+            headers["Authorization"] = ORS_API_KEY
+
+        body = {
+            "coordinates": [[slon, slat], [elon, elat]],
+            "format": "geojson",
+            "instructions": False
+        }
+        r = requests.post(url, headers=headers, json=body, timeout=15)
+        ors_data = r.json()
+
+        if r.status_code != 200 or "features" not in ors_data:
+            error_msg = ors_data.get("error", {}).get("message", "Unknown ORS error")
+            return jsonify({"error": error_msg, "details": "ORS free tier limit may be reached (500/day). Add ORS_API_KEY to .env for higher limits."}), 502
+
+        feature = ors_data["features"][0]
+        coords = feature["geometry"]["coordinates"]
+        leaflet_coords = [[pt[1], pt[0]] for pt in coords]
+        props = feature.get("properties", {})
+        summary = props.get("summary", {})
+
+        return jsonify({
+            "provider": "openrouteservice",
+            "coords": leaflet_coords,
+            "distance": summary.get("distance", 0),
+            "duration": summary.get("duration", 0),
+            "has_traffic_data": False,
+            "note": "ORS duration includes live traffic blending where available"
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": f"ORS request failed: {e}"}), 500
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Time-aware route endpoint
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/route", methods=["POST"])
 def map_route():
-    """
-    POST /route
-    Used by the Leaflet frontend.
-    Payload: {"start": [lat, lon], "end": [lat, lon], "algorithm": "both"|"dijkstra"|"astar"}
-    Returns dijkstra + astar coords, lengths, times, and traffic metrics.
-    """
-    data      = request.get_json(force=True)
+    data = request.get_json(force=True)
     start_lat, start_lon = data["start"]
-    end_lat,   end_lon   = data["end"]
-    algo      = data.get("algorithm", "both")
+    end_lat, end_lon = data["end"]
+    algo = data.get("algorithm", "both")
+    use_time_traffic = data.get("use_time_traffic", False)
+    hour = data.get("hour", datetime.now().hour)
 
     G = _graph_db.get(OSM_GRAPH_ID)
     if G is None:
@@ -144,60 +421,185 @@ def map_route():
 
     try:
         source = _get_nearest_node(G, start_lat, start_lon)
-        target = _get_nearest_node(G, end_lat,   end_lon)
+        target = _get_nearest_node(G, end_lat, end_lon)
     except Exception as e:
         return jsonify({"error": f"Node snap failed: {e}"}), 400
 
+    _simulation_config["hour_of_day"] = hour
+    RG, weight_key = _get_routing_graph(G, use_time_traffic=use_time_traffic)
     result = {}
 
     if algo in ("both", "dijkstra"):
         t0 = time.perf_counter()
         try:
-            d_path = nx.shortest_path(G, source, target, weight="length")
+            d_path = nx.shortest_path(RG, source, target, weight=weight_key)
         except nx.NetworkXNoPath:
             return jsonify({"error": "No Dijkstra path found between these points"}), 404
         d_time = time.perf_counter() - t0
         _, d_adj, d_metrics = _apply_traffic_delay(G, d_path)
+        d_estimated_duration = _estimate_travel_time(G, d_path, hour)
         result.update({
-            "dijkstra":  _nodes_to_coords(G, d_path),
-            "d_len":     _route_length(G, d_path),
-            "d_time":    d_time,
+            "dijkstra": _route_to_coords_lightweight(G, d_path),
+            "d_len": _route_length(G, d_path),
+            "d_time": d_time,
             "d_metrics": d_metrics,
+            "d_estimated_duration": round(d_estimated_duration, 1),
         })
 
     if algo in ("both", "astar"):
         t0 = time.perf_counter()
         try:
             a_path = nx.astar_path(
-                G, source, target,
+                RG, source, target,
                 heuristic=lambda u, v: _heuristic_osm(G, u, v),
-                weight="length"
+                weight=weight_key
             )
         except nx.NetworkXNoPath:
             return jsonify({"error": "No A* path found between these points"}), 404
         a_time = time.perf_counter() - t0
         _, a_adj, a_metrics = _apply_traffic_delay(G, a_path)
+        a_estimated_duration = _estimate_travel_time(G, a_path, hour)
         result.update({
-            "astar":    _nodes_to_coords(G, a_path),
-            "a_len":    _route_length(G, a_path),
-            "a_time":   a_time,
+            "astar": _route_to_coords_lightweight(G, a_path),
+            "a_len": _route_length(G, a_path),
+            "a_time": a_time,
             "a_metrics": a_metrics,
+            "a_estimated_duration": round(a_estimated_duration, 1),
         })
 
+    result["hour"] = hour
+    result["time_aware"] = use_time_traffic
     return jsonify(result), 200
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Generic graph REST API (from Route Optimizer)
+# Alternative routes endpoint
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/route-alternatives", methods=["POST"])
+def map_route_alternatives():
+    data = request.get_json(force=True)
+    start_lat, start_lon = data["start"]
+    end_lat, end_lon = data["end"]
+    algo = data.get("algorithm", "both")
+    num_alternatives = min(data.get("num_alternatives", 2), 4)
+    max_factor = data.get("max_length_factor", 1.3)
+    use_time_traffic = data.get("use_time_traffic", False)
+    hour = data.get("hour", datetime.now().hour)
+
+    G = _graph_db.get(OSM_GRAPH_ID)
+    if G is None:
+        return jsonify({"error": "OSM graph not loaded yet — try again in a few seconds"}), 503
+
+    try:
+        source = _get_nearest_node(G, start_lat, start_lon)
+        target = _get_nearest_node(G, end_lat, end_lon)
+    except Exception as e:
+        return jsonify({"error": f"Node snap failed: {e}"}), 400
+
+    _simulation_config["hour_of_day"] = hour
+    RG, weight_key = _get_routing_graph(G, use_time_traffic=use_time_traffic)
+    paths_result = []
+
+    def build_path_entry(path, algo_name, is_primary, shortest_len):
+        t0 = time.perf_counter()
+        path_coords = _route_to_coords_lightweight(G, path)
+        compute_time = time.perf_counter() - t0
+        length = _route_length(G, path)
+        _, adj, metrics = _apply_traffic_delay(G, path)
+        estimated_duration = _estimate_travel_time(G, path, hour)
+        delta_pct = round(((length / shortest_len) - 1) * 100, 1) if shortest_len > 0 else 0
+        return {
+            "algorithm": algo_name,
+            "primary": is_primary,
+            "coords": path_coords,
+            "length": round(length, 1),
+            "time": round(compute_time, 4),
+            "metrics": metrics,
+            "delta_pct": delta_pct,
+            "estimated_duration": round(estimated_duration, 1),
+        }
+
+    if algo in ("both", "dijkstra"):
+        alt_paths = _find_alternative_paths(RG, source, target, num_paths=num_alternatives, max_factor=max_factor)
+        if alt_paths:
+            shortest_len = alt_paths[0][1]
+            for i, (path, _) in enumerate(alt_paths):
+                paths_result.append(build_path_entry(path, "dijkstra", i == 0, shortest_len))
+
+    if algo in ("both", "astar"):
+        try:
+            a_primary = nx.astar_path(
+                RG, source, target,
+                heuristic=lambda u, v: _heuristic_osm(G, u, v),
+                weight=weight_key
+            )
+        except nx.NetworkXNoPath:
+            pass
+        else:
+            shortest_len = _route_length(G, a_primary)
+            paths_result.append(build_path_entry(a_primary, "astar", True, shortest_len))
+            penalized_edges = set()
+            for u, v in zip(a_primary, a_primary[1:]):
+                penalized_edges.add((min(u, v), max(u, v)))
+            current_penalty = 0.5
+            found = 1
+            while found < num_alternatives:
+                def make_weight_fn(pen_edges, pen_mult):
+                    def weight_fn(u, v, d):
+                        base = d.get(weight_key, 1.0)
+                        if (min(u, v), max(u, v)) in pen_edges:
+                            return base * (1 + pen_mult)
+                        return base
+                    return weight_fn
+                wfn = make_weight_fn(penalized_edges, current_penalty)
+                try:
+                    alt = nx.astar_path(
+                        RG, source, target,
+                        heuristic=lambda u, v: _heuristic_osm(G, u, v),
+                        weight=wfn
+                    )
+                    alt_len = _route_length(G, alt)
+                    max_allowed = shortest_len * max_factor
+                    if alt_len <= max_allowed:
+                        alt_edge_set = set((min(u, v), max(u, v)) for u, v in zip(alt, alt[1:]))
+                        is_diverse = True
+                        for existing in [p for p in paths_result if p["algorithm"] == "astar"]:
+                            primary_edges = set((min(u, v), max(u, v)) for u, v in zip(a_primary, a_primary[1:]))
+                            jaccard = len(alt_edge_set & primary_edges) / len(alt_edge_set | primary_edges) if len(alt_edge_set | primary_edges) > 0 else 0
+                            if jaccard > 0.65:
+                                is_diverse = False
+                                break
+                        if is_diverse:
+                            paths_result.append(build_path_entry(alt, "astar", False, shortest_len))
+                            found += 1
+                            for u, v in zip(alt, alt[1:]):
+                                penalized_edges.add((min(u, v), max(u, v)))
+                            current_penalty = 0.5
+                        else:
+                            current_penalty += 0.3
+                    else:
+                        break
+                except nx.NetworkXNoPath:
+                    break
+
+    if not paths_result:
+        return jsonify({"error": "No paths found between these points"}), 404
+
+    return jsonify({"paths": paths_result, "hour": hour, "time_aware": use_time_traffic}), 200
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Generic graph REST API
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/graph", methods=["POST"])
 def create_graph():
-    data     = request.get_json(force=True)
+    data = request.get_json(force=True)
     graph_id = data.get("graph_id", "default")
     G = nx.DiGraph()
     for node in data.get("nodes", []):
-        nid   = node["id"] if isinstance(node, dict) else node
+        nid = node["id"] if isinstance(node, dict) else node
         attrs = {k: v for k, v in node.items() if k != "id"} if isinstance(node, dict) else {}
         G.add_node(nid, **attrs)
     for edge in data.get("edges", []):
@@ -210,10 +612,10 @@ def create_graph():
 
 @app.route("/shortest-path", methods=["POST"])
 def shortest_path():
-    data      = request.get_json(force=True)
-    graph_id  = data.get("graph_id", "default")
-    source    = data.get("source")
-    target    = data.get("target")
+    data = request.get_json(force=True)
+    graph_id = data.get("graph_id", "default")
+    source = data.get("source")
+    target = data.get("target")
     algorithm = data.get("algorithm", "dijkstra").lower()
 
     if graph_id not in _graph_db:
@@ -248,14 +650,14 @@ def shortest_path():
 
 @app.route("/delay-analysis", methods=["POST"])
 def delay_analysis():
-    data     = request.get_json(force=True)
+    data = request.get_json(force=True)
     graph_id = data.get("graph_id", "default")
     if graph_id not in _graph_db:
         return jsonify({"error": f"Graph '{graph_id}' not found"}), 404
     G = _graph_db[graph_id]
     edge_delays = []
     for u, v, attrs in G.edges(data=True):
-        base    = attrs.get("base_weight", 1.0)
+        base = attrs.get("base_weight", 1.0)
         current = attrs.get("weight", 1.0)
         edge_delays.append({
             "edge": f"{u} -> {v}", "base_weight": base, "current_weight": current,
@@ -273,7 +675,7 @@ def delay_analysis():
 
 @app.route("/route-insights", methods=["POST"])
 def route_insights():
-    data     = request.get_json(force=True)
+    data = request.get_json(force=True)
     graph_id = data.get("graph_id", "default")
     if graph_id not in _graph_db:
         return jsonify({"error": f"Graph '{graph_id}' not found"}), 404
@@ -284,7 +686,7 @@ def route_insights():
         avg_path_length = nx.average_shortest_path_length(G, weight="weight")
     except nx.NetworkXError:
         avg_path_length = None
-    in_degrees  = [d for _, d in G.in_degree()]
+    in_degrees = [d for _, d in G.in_degree()]
     out_degrees = [d for _, d in G.out_degree()]
     return jsonify({
         "graph_id": graph_id,
@@ -292,9 +694,9 @@ def route_insights():
         "average_path_length": round(avg_path_length, 2) if avg_path_length else None,
         "top_bottlenecks": [{"node": n, "centrality": round(c, 4)} for n, c in top_bottlenecks],
         "degree_stats": {
-            "avg_in_degree":  round(sum(in_degrees)  / len(in_degrees),  2) if in_degrees  else 0,
+            "avg_in_degree": round(sum(in_degrees) / len(in_degrees), 2) if in_degrees else 0,
             "avg_out_degree": round(sum(out_degrees) / len(out_degrees), 2) if out_degrees else 0,
-            "max_in_degree":  max(in_degrees)  if in_degrees  else 0,
+            "max_in_degree": max(in_degrees) if in_degrees else 0,
             "max_out_degree": max(out_degrees) if out_degrees else 0,
         },
         "timestamp": datetime.utcnow().isoformat() + "Z"
@@ -305,7 +707,8 @@ def route_insights():
 def simulate_congestion():
     data = request.get_json(force=True)
     _simulation_config["congestion_factor"] = data.get("congestion_factor", 1.0)
-    _simulation_config["delay_per_edge"]    = data.get("delay_per_edge",    0.0)
+    _simulation_config["delay_per_edge"] = data.get("delay_per_edge", 0.0)
+    _simulation_config["hour_of_day"] = data.get("hour", datetime.now().hour)
     return jsonify({"status": "simulation_config_updated", "config": _simulation_config}), 200
 
 
@@ -314,7 +717,8 @@ def health():
     return jsonify({
         "status": "healthy",
         "graphs_loaded": len(_graph_db),
-        "osm_graph_ready": OSM_GRAPH_ID in _graph_db
+        "osm_graph_ready": OSM_GRAPH_ID in _graph_db,
+        "ors_api_ready": True  # ORS works without key
     }), 200
 
 

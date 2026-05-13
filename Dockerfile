@@ -1,19 +1,32 @@
 FROM python:3.11-slim
 
+# Install system dependencies for the geospatial stack (OSMnx, GeoPandas, Shapely, Rtree)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    libgeos-dev \
+    libproj-dev \
+    gdal-bin \
+    libgdal-dev \
+    libspatialindex-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# System deps for osmnx / shapely
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgeos-dev libspatialindex-dev gdal-bin libgdal-dev && \
-    rm -rf /var/lib/apt/lists/*
-
+# Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Application code
 COPY . .
+
+# Persistent cache directory for OSM graph
+RUN mkdir -p /app/cache
+
+ENV FLASK_APP=app.py
+ENV PYTHONUNBUFFERED=1
+ENV GRAPH_CACHE_DIR=/app/cache
 
 EXPOSE 5000
 
-# gunicorn for production; long timeout because OSM graph takes ~20s to load
-CMD ["python", "-c", \
-     "from app import app, load_osm_graph; load_osm_graph(); app.run(host='0.0.0.0', port=5000)"]
+CMD ["python", "app.py"]
