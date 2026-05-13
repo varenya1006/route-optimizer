@@ -17,37 +17,26 @@ import math
 import os
 import requests
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 from geopy.distance import geodesic
 from dotenv import load_dotenv
 
-# ── Load environment variables ────────────────────────────────────────────────
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
-# ── API keys from .env (optional) ─────────────────────────────────────────────
-ORS_API_KEY = os.environ.get("ORS_API_KEY", "")
-
-# ── In-memory graph store ──────────────────────────────────────────────────────
 _graph_db: Dict[str, nx.MultiDiGraph] = {}
 _simulation_config = {"congestion_factor": 1.0, "delay_per_edge": 0.0, "hour_of_day": datetime.now().hour}
 
-# ── OSM graph constants ────────────────────────────────────────────────────────
 OSM_GRAPH_ID = "nagpur_osm"
-OSM_CENTER = (21.1458, 79.0882)   # Nagpur, Maharashtra
-OSM_DIST   = 5000                  # metres radius
+OSM_CENTER = (21.1458, 79.0882)
+OSM_DIST = 5000
 
-# ── Graph cache ────────────────────────────────────────────────────────────────
 GRAPH_CACHE_DIR = os.environ.get("GRAPH_CACHE_DIR", os.path.join(os.path.dirname(__file__), "cache"))
 GRAPHML_PATH = os.path.join(GRAPH_CACHE_DIR, "nagpur_graph.graphml")
 os.makedirs(GRAPH_CACHE_DIR, exist_ok=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Time-of-day speed profiles (km/h) by road class
-# Based on typical Indian urban traffic patterns
-# ═══════════════════════════════════════════════════════════════════════════════
 SPEED_PROFILES = {
     "motorway":     {"00-05": 90, "05-08": 70, "08-11": 55, "11-14": 65, "14-17": 50, "17-20": 45, "20-24": 75},
     "trunk":        {"00-05": 80, "05-08": 60, "08-11": 45, "11-14": 55, "14-17": 40, "17-20": 35, "20-24": 65},
@@ -61,9 +50,7 @@ SPEED_PROFILES = {
 
 
 def _get_speed_for_road_class(road_class: str, hour: int) -> float:
-    """Get typical speed (km/h) for a road class at a given hour."""
     profile = SPEED_PROFILES.get(road_class, SPEED_PROFILES["unclassified"])
-    # Find the right time bucket
     buckets = [
         (0, 5, "00-05"), (5, 8, "05-08"), (8, 11, "08-11"), (11, 14, "11-14"),
         (14, 17, "14-17"), (17, 20, "17-20"), (20, 24, "20-24")
@@ -74,10 +61,6 @@ def _get_speed_for_road_class(road_class: str, hour: int) -> float:
     return profile["00-05"]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Startup: load real-world OSM graph (cached)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def load_osm_graph():
     if os.path.exists(GRAPHML_PATH):
         print(f"[startup] Loading cached OSM graph from {GRAPHML_PATH}…")
@@ -85,7 +68,6 @@ def load_osm_graph():
         _graph_db[OSM_GRAPH_ID] = G
         print(f"[startup] Cached graph loaded — {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
         return
-
     print(f"[startup] Downloading OSM graph for Nagpur ({OSM_DIST}m radius)…")
     G = ox.graph_from_point(OSM_CENTER, dist=OSM_DIST, network_type="drive")
     ox.save_graphml(G, GRAPHML_PATH)
@@ -93,12 +75,7 @@ def load_osm_graph():
     print(f"[startup] OSM graph downloaded & cached — {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _get_nearest_node(G, lat: float, lon: float) -> int:
-    """Snap a lat/lon coordinate to the nearest drivable OSM node."""
     u, v, _ = ox.distance.nearest_edges(G, lon, lat)
     u_pt = (G.nodes[u]["y"], G.nodes[u]["x"])
     v_pt = (G.nodes[v]["y"], G.nodes[v]["x"])
@@ -116,7 +93,6 @@ def _route_length(G, route: List) -> float:
 
 
 def _route_to_coords_lightweight(G, route: List, max_points_per_edge: int = 8, min_edge_meters: float = 80.0) -> List[List[float]]:
-    """Returns route coordinates that follow actual road curvature."""
     coords = []
     for u, v in zip(route, route[1:]):
         edge_data = min(G.get_edge_data(u, v).values(), key=lambda d: d.get("length", 0))
@@ -143,7 +119,6 @@ def _route_to_coords_lightweight(G, route: List, max_points_per_edge: int = 8, m
 
 
 def _heuristic_osm(G, u, v) -> float:
-    """Admissible haversine heuristic in meters."""
     y1, x1 = G.nodes[u]["y"], G.nodes[u]["x"]
     y2, x2 = G.nodes[v]["y"], G.nodes[v]["x"]
     lat1, lon1 = math.radians(y1), math.radians(x1)
@@ -162,20 +137,15 @@ def _heuristic_generic(u: str, v: str, G: nx.DiGraph) -> float:
 
 
 def _get_routing_graph(G, use_time_traffic: bool = False):
-    """Return a graph with traffic-adjusted weights and the weight key to use."""
     cf = _simulation_config["congestion_factor"]
     dp = _simulation_config["delay_per_edge"]
     hour = _simulation_config.get("hour_of_day", datetime.now().hour)
-
     if not use_time_traffic and abs(cf - 1.0) < 1e-9 and abs(dp) < 1e-9:
         return G, "length"
-
     H = G.copy()
     for u, v, key, data in H.edges(keys=True, data=True):
         base = data.get("length", 1.0)
-
         if use_time_traffic:
-            # Time-of-day weight: length / speed * 3.6 (convert km/h to m/s, then to seconds)
             road_class = data.get("highway", "unclassified")
             if isinstance(road_class, list):
                 road_class = road_class[0]
@@ -185,7 +155,6 @@ def _get_routing_graph(G, use_time_traffic: bool = False):
         else:
             delay = dp * cf
             data["weight"] = base * cf + delay
-
     return H, "weight"
 
 
@@ -212,7 +181,6 @@ def _apply_traffic_delay(G, path: List) -> Tuple[List, float, Dict]:
 
 
 def _estimate_travel_time(G, path: List, hour: int) -> float:
-    """Estimate realistic travel time (seconds) using time-of-day speeds."""
     total_time = 0.0
     for a, b in zip(path, path[1:]):
         edges = G.get_edge_data(a, b)
@@ -229,7 +197,6 @@ def _estimate_travel_time(G, path: List, hour: int) -> float:
 
 
 def _find_alternative_paths(G, source, target, num_paths=3, max_factor=1.3, penalty=0.5, similarity_threshold=0.65):
-    """Find multiple diverse paths of similar length using iterative edge penalty."""
     weight_key = "length"
     try:
         p1 = nx.shortest_path(G, source, target, weight=weight_key)
@@ -301,18 +268,10 @@ def _find_alternative_paths(G, source, target, num_paths=3, max_factor=1.3, pena
     return results
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Frontend route
-# ═══════════════════════════════════════════════════════════════════════════════
-
 @app.route("/")
 def index():
     return render_template("index.html")
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Geocode & Reverse Geocode
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/geocode", methods=["GET"])
 def geocode_proxy():
@@ -344,67 +303,6 @@ def reverse_geocode_proxy():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ORS Reference Route — completely free, no credit card
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.route("/traffic-reference", methods=["POST"])
-def traffic_reference():
-    """
-    POST /traffic-reference
-    Proxies a route from OpenRouteService (free, no credit card required).
-    Returns the external route geometry + duration for comparison.
-    """
-    data = request.get_json(force=True)
-    start_lat, start_lon = data["start"]
-    end_lat, end_lon = data["end"]
-
-    return _ors_route(start_lon, start_lat, end_lon, end_lat)
-
-
-def _ors_route(slon, slat, elon, elat):
-    """Call OpenRouteService Directions API. Free tier: 500 req/day without key."""
-    try:
-        url = "https://api.openrouteservice.org/v2/directions/driving-car"
-        headers = {"Content-Type": "application/json"}
-        if ORS_API_KEY:
-            headers["Authorization"] = ORS_API_KEY
-
-        body = {
-            "coordinates": [[slon, slat], [elon, elat]],
-            "format": "geojson",
-            "instructions": False
-        }
-        r = requests.post(url, headers=headers, json=body, timeout=15)
-        ors_data = r.json()
-
-        if r.status_code != 200 or "features" not in ors_data:
-            error_msg = ors_data.get("error", {}).get("message", "Unknown ORS error")
-            return jsonify({"error": error_msg, "details": "ORS free tier limit may be reached (500/day). Add ORS_API_KEY to .env for higher limits."}), 502
-
-        feature = ors_data["features"][0]
-        coords = feature["geometry"]["coordinates"]
-        leaflet_coords = [[pt[1], pt[0]] for pt in coords]
-        props = feature.get("properties", {})
-        summary = props.get("summary", {})
-
-        return jsonify({
-            "provider": "openrouteservice",
-            "coords": leaflet_coords,
-            "distance": summary.get("distance", 0),
-            "duration": summary.get("duration", 0),
-            "has_traffic_data": False,
-            "note": "ORS duration includes live traffic blending where available"
-        }), 200
-
-    except Exception as e:
-        return jsonify({"error": f"ORS request failed: {e}"}), 500
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Time-aware route endpoint
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/route", methods=["POST"])
 def map_route():
@@ -471,10 +369,6 @@ def map_route():
     result["time_aware"] = use_time_traffic
     return jsonify(result), 200
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Alternative routes endpoint
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/route-alternatives", methods=["POST"])
 def map_route_alternatives():
@@ -588,10 +482,6 @@ def map_route_alternatives():
 
     return jsonify({"paths": paths_result, "hour": hour, "time_aware": use_time_traffic}), 200
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Generic graph REST API
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/graph", methods=["POST"])
 def create_graph():
@@ -717,14 +607,9 @@ def health():
     return jsonify({
         "status": "healthy",
         "graphs_loaded": len(_graph_db),
-        "osm_graph_ready": OSM_GRAPH_ID in _graph_db,
-        "ors_api_ready": True  # ORS works without key
+        "osm_graph_ready": OSM_GRAPH_ID in _graph_db
     }), 200
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Entry point
-# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     load_osm_graph()
